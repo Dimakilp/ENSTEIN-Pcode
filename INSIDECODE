@@ -1,0 +1,481 @@
+/*
+  EINSTEIN-P Flight Firmware (ESP32 WROOM-32)
+  - Log to microSD every 30 s
+  - Send LoRa telemetry every 60 s (P2P)
+  - SAFE mode on low battery: disables MQ heater + reduces payload
+  - Computes simple Pollution Index (0..100) from dust + gas (relative)
+*/
+
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+
+#include <LoRa.h>
+#include <TinyGPSPlus.h>
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#include <Adafruit_ADS1X15.h>
+#include <Adafruit_INA219.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_VEML7700.h>
+
+// MS5611 library name may differ; adjust include if needed
+#include <MS5611.h>
+
+// MPU6050 library may differ; adjust if needed
+#include <MPU6050.h>
+
+// -------------------- Pins --------------------
+static const int PIN_I2C_SDA = 21;
+static const int PIN_I2C_SCL = 22;
+
+// SPI shared
+static const int PIN_SPI_SCK  = 18;
+static const int PIN_SPI_MISO = 19;
+static const int PIN_SPI_MOSI = 23;
+
+// SD
+static const int PIN_SD_CS = 5;
+
+// LoRa RA-02
+static const int PIN_LORA_CS   = 27;
+static const int PIN_LORA_RST  = 14;
+static const int PIN_LORA_DIO0 = 26;
+
+// GNSS UART
+static const int PIN_GPS_RX = 16; // ESP32 RX1
+static const int PIN_GPS_TX = 17; // ESP32 TX1
+
+// OneWire DS18B20
+static const int PIN_ONEWIRE = 4;
+
+// Switch & keys
+static const int PIN_ARM_SWITCH   = 32; // HIGH=ARM
+static const int PIN_MQ_HEATER_EN = 25;
+static const int PIN_GP2Y_LED_EN  = 13;
+
+// ADC
+static const int PIN_MQ135_ADC   = 36; // ADC1
+static const int PIN_BATT_ADC    = 39; // ADC1 (divider 10k/10k)
+
+// -------------------- LoRa Settings --------------------
+static const long LORA_FREQ = 433E6;
+static const int  LORA_TX_DBM = 17;      // safe default
+static const int  LORA_SF = 11;          // reliable
+static const long LORA_BW = 125E3;       // 125 kHz
+static const int  LORA_CR_DENOM = 5;     // 4/5
+static const bool LORA_CRC = true;
+static const uint8_t LORA_SYNCWORD = 0x12; // private
+
+// -------------------- Timing --------------------
+static const uint32_t LOG_PERIOD_MS   = 30UL * 1000UL;
+static const uint32_t TELEM_PERIOD_MS = 60UL * 1000UL;
+
+// -------------------- SAFE thresholds --------------------
+static const float VBATT_SAFE_ENTER = 3.55; // V  (tune!)
+static const float VBATT_SAFE_EXIT  = 3.70; // V  hysteresis
+
+// -------------------- Sensors --------------------
+TinyGPSPlus gps;
+
+OneWire oneWire(PIN_ONEWIRE);
+DallasTemperature ds18(&oneWire);
+
+Adafruit_ADS1115 ads;
+Adafruit_INA219 ina219;
+Adafruit_BME280 bme;
+Adafruit_VEML7700 veml;
+MS5611 ms5611;
+MPU6050 mpu;
+
+// -------------------- State --------------------
+File logFile;
+String logFilename;
+
+bool isSafeMode = false;
+uint32_t lastLogMs = 0;
+uint32_t lastTelemMs = 0;
+
+// Baselines for pollution index
+bool baselineReady = false;
+uint32_t baselineCount = 0;
+float baselineDust = 0.0f;  // dust mg/m3 estimate (or raw)
+float baselineGas  = 0.0f;  // gas raw
+static const uint32_t BASELINE_SAMPLES = 20; // first ~10 min if 30s interval? (but we take every loop)
+
+// -------------------- Helpers --------------------
+float clamp01(float x) { return (x < 0) ? 0 : (x > 1) ? 1 : x; }
+
+String isoTimeUTC() {
+  if (gps.time.isValid() && gps.date.isValid()) {
+    char buf[25];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             gps.date.year(), gps.date.month(), gps.date.day(),
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+    return String(buf);
+  }
+  return String(""); // unknown
+}
+
+float readBatteryVoltage() {
+  // Uses divider 10k/10k => Vbatt = Vadc * 2
+  // analogReadMilliVolts returns mV (ESP32 core)
+  uint32_t mv = analogReadMilliVolts(PIN_BATT_ADC);
+  float vadc = mv / 1000.0f;
+  return vadc * 2.0f;
+}
+
+float readMQ135Raw() {
+  // raw ADC (0..4095). You can convert to volts with analogReadMilliVolts.
+  const int N = 10;
+  uint32_t sum = 0;
+  for (int i=0;i<N;i++) { sum += analogRead(PIN_MQ135_ADC); delay(2); }
+  return (float)sum / (float)N;
+}
+
+float adsToVolts(int16_t counts, float fsRangeVolts) {
+  // ADS1115: 16-bit signed, full scale depends on gain.
+  // With GAIN_ONE, fsRange ~ 4.096V, LSB=125uV.
+  return (counts * fsRangeVolts) / 32768.0f;
+}
+
+float estimateDust_mg_m3_from_GP2Y(float v) {
+  // Very rough: common approximation from GP2Y1010 graphs:
+  // dust(mg/m3) ≈ 0.17*V - 0.1  (clamp >=0)
+  float d = 0.17f * v - 0.1f;
+  if (d < 0) d = 0;
+  return d;
+}
+
+float ntcToCelsius(float v, float vcc=3.3f) {
+  // Assumption: voltage divider with fixed resistor 10k to Vcc and NTC to GND,
+  // Vout measured at midpoint (between Rfixed and NTC).
+  // If your wiring is opposite, swap formula.
+  const float R_FIXED = 10000.0f;
+  const float BETA = 3950.0f;
+  const float T0 = 298.15f; // 25C in Kelvin
+  const float R0 = 10000.0f;
+
+  if (v <= 0.001f || v >= vcc-0.001f) return NAN;
+
+  float r_ntc = (v * R_FIXED) / (vcc - v); // for R_FIXED to Vcc, NTC to GND
+  float invT = (1.0f/T0) + (1.0f/BETA) * log(r_ntc / R0);
+  float tempK = 1.0f / invT;
+  return tempK - 273.15f;
+}
+
+int pollutionIndex(float dust_mg_m3, float gas_raw) {
+  // Relative + partly absolute scoring (simple, for “оценка загрязненности”)
+  // Dust score: assume 0.00..0.20 mg/m3 => 0..100 (rough)
+  float dustScore = clamp01(dust_mg_m3 / 0.20f);
+
+  // Gas score: relative to baseline (if ready), else weak contribution
+  float gasScore = 0.0f;
+  if (baselineReady && baselineGas > 1.0f) {
+    float ratio = gas_raw / baselineGas;     // 1.0 = baseline
+    gasScore = clamp01((ratio - 1.0f) / 2.0f); // ratio 3.0 => 1.0
+  } else {
+    gasScore = 0.2f; // neutral
+  }
+
+  float idx = 100.0f * (0.7f * dustScore + 0.3f * gasScore);
+  if (idx < 0) idx = 0;
+  if (idx > 100) idx = 100;
+  return (int)(idx + 0.5f);
+}
+
+const char* pollutionLabel(int idx) {
+  if (idx <= 20) return "GOOD";
+  if (idx <= 40) return "MODERATE";
+  if (idx <= 60) return "UNH_SENS";
+  if (idx <= 80) return "UNHEALTHY";
+  return "HAZARDOUS";
+}
+
+void setSafeMode(bool en) {
+  isSafeMode = en;
+  if (isSafeMode) {
+    digitalWrite(PIN_MQ_HEATER_EN, LOW);
+    digitalWrite(PIN_GP2Y_LED_EN, LOW);
+  }
+}
+
+String makeLogFilename() {
+  // If GPS time available, name with UTC; else millis
+  if (gps.time.isValid() && gps.date.isValid()) {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "/EINP_%04d%02d%02d_%02d%02d%02d.csv",
+      gps.date.year(), gps.date.month(), gps.date.day(),
+      gps.time.hour(), gps.time.minute(), gps.time.second());
+    return String(buf);
+  }
+  return String("/EINP_BOOT.csv");
+}
+
+void ensureLogFile() {
+  if (logFilename.length() == 0) logFilename = makeLogFilename();
+  if (!SD.exists(logFilename)) {
+    logFile = SD.open(logFilename, FILE_WRITE);
+    if (logFile) {
+      logFile.println("ms,utc,lat,lon,alt_gps_m,alt_baro_m,tempC,hum_pct,press_hPa,light_lux,uv_raw,dust_mg_m3,gas_raw,batt_V,batt_I_mA,bat_tempC,int_tempC,ax,ay,az,gx,gy,gz,pi,pi_label,mode");
+      logFile.flush();
+      logFile.close();
+    }
+  }
+}
+
+void writeLogLine(const String& line) {
+  logFile = SD.open(logFilename, FILE_APPEND);
+  if (logFile) {
+    logFile.println(line);
+    logFile.flush();
+    logFile.close();
+  }
+}
+
+void sendTelemetry(const String& payload) {
+  LoRa.beginPacket();
+  LoRa.print(payload);
+  LoRa.endPacket(true); // async
+}
+
+// -------------------- Setup --------------------
+void setup() {
+  pinMode(PIN_ARM_SWITCH, INPUT_PULLUP); // switch to GND => SAFE; to Vcc => ARM (adjust if needed)
+  pinMode(PIN_MQ_HEATER_EN, OUTPUT);
+  pinMode(PIN_GP2Y_LED_EN, OUTPUT);
+  digitalWrite(PIN_MQ_HEATER_EN, LOW);
+  digitalWrite(PIN_GP2Y_LED_EN, LOW);
+
+  pinMode(PIN_MQ135_ADC, INPUT);
+  pinMode(PIN_BATT_ADC, INPUT);
+
+  Serial.begin(115200);
+  delay(200);
+
+  // I2C
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+
+  // GNSS
+  Serial1.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+
+  // Sensors init
+  bool ok_bme = bme.begin(0x76);
+  bool ok_veml = veml.begin();
+  if (ok_veml) veml.setGain(VEML7700_GAIN_1);
+  if (ok_veml) veml.setIntegrationTime(VEML7700_IT_100MS);
+
+  ads.setGain(GAIN_ONE); // +/-4.096V
+  bool ok_ads = ads.begin();
+
+  bool ok_ina = ina219.begin();
+  ms5611.begin();
+  mpu.initialize();
+
+  ds18.begin();
+
+  // SPI & SD
+  SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+  bool ok_sd = SD.begin(PIN_SD_CS, SPI);
+
+  // LoRa
+  LoRa.setPins(PIN_LORA_CS, PIN_LORA_RST, PIN_LORA_DIO0);
+  if (!LoRa.begin(LORA_FREQ)) {
+    Serial.println("LoRa init FAILED");
+  } else {
+    LoRa.setTxPower(LORA_TX_DBM);
+    LoRa.setSpreadingFactor(LORA_SF);
+    LoRa.setSignalBandwidth(LORA_BW);
+    LoRa.setCodingRate4(LORA_CR_DENOM);
+    LoRa.setSyncWord(LORA_SYNCWORD);
+    LoRa.enableCrc();
+    Serial.println("LoRa OK");
+  }
+
+  // initial SAFE/ARM state
+  bool arm = (digitalRead(PIN_ARM_SWITCH) == HIGH);
+  if (arm) {
+    digitalWrite(PIN_GP2Y_LED_EN, HIGH); // allow dust sensor LED pulses (still controlled logically if you want)
+  }
+  setSafeMode(false);
+
+  if (ok_sd) {
+    ensureLogFile();
+    writeLogLine(String("0,,,,")); // tiny marker (optional)
+  }
+
+  Serial.println("EINSTEIN-P ready");
+  lastLogMs = millis();
+  lastTelemMs = millis();
+}
+
+// -------------------- Loop --------------------
+void loop() {
+  // GNSS parse
+  while (Serial1.available()) {
+    gps.encode(Serial1.read());
+  }
+
+  // ARM?
+  bool arm = (digitalRead(PIN_ARM_SWITCH) == HIGH);
+
+  // Read battery
+  float vbatt = readBatteryVoltage();
+
+  // SAFE logic
+  if (!arm) {
+    // If not armed, keep heavy loads off and do nothing aggressive
+    setSafeMode(true);
+    delay(200);
+    return;
+  } else {
+    // Arm: decide safe/normal based on battery
+    if (!isSafeMode && vbatt < VBATT_SAFE_ENTER) setSafeMode(true);
+    if (isSafeMode && vbatt > VBATT_SAFE_EXIT) setSafeMode(false);
+  }
+
+  // Control heavy loads
+  // MQ heater: ON only if not safe
+  digitalWrite(PIN_MQ_HEATER_EN, isSafeMode ? LOW : HIGH);
+
+  // GP2Y LED: you can pulse it only during sampling; here keep enabled in normal
+  digitalWrite(PIN_GP2Y_LED_EN, isSafeMode ? LOW : HIGH);
+
+  uint32_t now = millis();
+
+  // --- Sample sensors (we do it each loop; log/telem by timers) ---
+  // BME280
+  float tempC = bme.readTemperature();
+  float hum = bme.readHumidity();
+  float press_hPa = bme.readPressure() / 100.0f;
+
+  // MS5611
+  float press2 = ms5611.readPressure(); // depending on lib: Pa or mbar; adjust if needed
+  // We'll compute baro altitude from BME pressure as stable default
+  float alt_baro_m = 44330.0f * (1.0f - pow(press_hPa / 1013.25f, 0.1903f));
+
+  // Light
+  float lux = veml.readLux();
+
+  // INA219
+  float batt_I_mA = 0.0f;
+  if (ina219.begin()) { // safe guard, but begin() each loop is heavy; you can remove and trust ok_ina
+    batt_I_mA = ina219.getCurrent_mA();
+  }
+
+  // ADS1115 readings
+  // Gain ONE => FS=4.096V
+  const float ADS_FS = 4.096f;
+  int16_t a0 = ads.readADC_SingleEnded(0); // dust
+  int16_t a1 = ads.readADC_SingleEnded(1); // UV
+  int16_t a2 = ads.readADC_SingleEnded(2); // NTC
+
+  float v_dust = adsToVolts(a0, ADS_FS);
+  float v_uv   = adsToVolts(a1, ADS_FS);
+  float v_ntc  = adsToVolts(a2, ADS_FS);
+
+  float dust_mg_m3 = estimateDust_mg_m3_from_GP2Y(v_dust);
+  float uv_raw = v_uv; // keep as volts for now
+  float temp_ntcC = ntcToCelsius(v_ntc);
+
+  // MQ-135 (ESP ADC raw)
+  float gas_raw = readMQ135Raw();
+
+  // DS18B20 temps
+  ds18.requestTemperatures();
+  float t0 = ds18.getTempCByIndex(0);
+  float t1 = ds18.getTempCByIndex(1);
+  // Map: index0=battery, index1=internal; if order is swapped, поменяйте местами
+  float bat_tempC = t0;
+  float int_tempC = t1;
+
+  // IMU (raw)
+  int16_t axr, ayr, azr, gxr, gyr, gzr;
+  mpu.getMotion6(&axr, &ayr, &azr, &gxr, &gyr, &gzr);
+
+  // GPS fields
+  double lat = gps.location.isValid() ? gps.location.lat() : NAN;
+  double lon = gps.location.isValid() ? gps.location.lng() : NAN;
+  double alt_gps = gps.altitude.isValid() ? gps.altitude.meters() : NAN;
+
+  // Baseline update (for gas relative scoring)
+  if (!baselineReady) {
+    // Use only when not safe + reasonable readings
+    baselineDust += dust_mg_m3;
+    baselineGas  += gas_raw;
+    baselineCount++;
+    if (baselineCount >= BASELINE_SAMPLES) {
+      baselineDust /= (float)baselineCount;
+      baselineGas  /= (float)baselineCount;
+      baselineReady = true;
+    }
+  }
+
+  int pi = pollutionIndex(dust_mg_m3, gas_raw);
+  const char* piLabel = pollutionLabel(pi);
+
+  // --- Logging every 30s ---
+  if (now - lastLogMs >= LOG_PERIOD_MS) {
+    lastLogMs = now;
+
+    ensureLogFile();
+
+    String utc = isoTimeUTC();
+    char line[256];
+    // mode: 1=safe, 0=normal
+    snprintf(line, sizeof(line),
+      "%lu,%s,%.6f,%.6f,%.1f,%.1f,%.2f,%.2f,%.2f,%.2f,%.3f,%.4f,%.1f,%.3f,%.1f,%.2f,%.2f,%d,%d,%d,%d,%d,%d,%d,%s,%d",
+      (unsigned long)now,
+      utc.c_str(),
+      isnan(lat) ? 0.0 : lat,
+      isnan(lon) ? 0.0 : lon,
+      isnan(alt_gps) ? -1.0 : (float)alt_gps,
+      alt_baro_m,
+      tempC, hum, press_hPa,
+      lux,
+      uv_raw,
+      dust_mg_m3,
+      gas_raw,
+      vbatt,
+      batt_I_mA,
+      bat_tempC,
+      int_tempC,
+      axr, ayr, azr, gxr, gyr, gzr,
+      pi, piLabel,
+      isSafeMode ? 1 : 0
+    );
+
+    writeLogLine(String(line));
+    Serial.println(String("LOG: ") + line);
+  }
+
+  // --- Telemetry every 60s ---
+  if (now - lastTelemMs >= TELEM_PERIOD_MS) {
+    lastTelemMs = now;
+
+    // Keep packet short. Format: TELEM,ms,lat,lon,alt,VB,PI,MODE,DUST, GAS, T, H, P
+    char payload[180];
+    snprintf(payload, sizeof(payload),
+      "TELEM,%lu,%.6f,%.6f,%.1f,%.2f,%d,%d,%.4f,%.1f,%.1f,%.1f,%.1f",
+      (unsigned long)now,
+      isnan(lat) ? 0.0 : lat,
+      isnan(lon) ? 0.0 : lon,
+      alt_baro_m,
+      vbatt,
+      pi,
+      isSafeMode ? 1 : 0,
+      dust_mg_m3,
+      gas_raw,
+      tempC,
+      hum,
+      press_hPa
+    );
+
+    sendTelemetry(String(payload));
+    Serial.println(String("TX: ") + payload);
+  }
+
+  delay(20);
+}
